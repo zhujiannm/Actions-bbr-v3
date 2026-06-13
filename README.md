@@ -36,6 +36,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/i
 7. 启用 BBR + CAKE
 8. 亚太机器 TCP 调优
 9. 卸载 BBR 内核
+10. BBR v3 智能带宽优化
+11. 清空网络优化配置
 ```
 
 常用流程：
@@ -45,6 +47,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/i
 3. 重新运行脚本，选择 `3` 检查 BBRv3 状态。
 4. 按需选择 `4` 到 `7` 设置队列算法。
 5. 亚太线路机器可选择 `8` 写入 TCP 收发窗口与空闲慢启动调优。
+6. 不确定线路参数时可选择 `10` 自动测速并按带宽档位计算 TCP 缓冲区。
+7. 需要撤回调优时可选择 `11` 清空脚本写入的网络优化配置。
 
 ## 内核与 BBR 策略
 
@@ -178,6 +182,65 @@ net.ipv4.tcp_slow_start_after_idle = 0
 ```text
 /etc/sysctl.d/99-joeyblog.conf
 ```
+
+## BBR v3 智能带宽优化
+
+运行脚本后选择：
+
+```text
+10. BBR v3 智能带宽优化
+```
+
+脚本会优先安装并运行 Ookla 官方 `speedtest`，自动尝试附近测速服务器并获取上传带宽、下载带宽和 Ping；如果测速失败，会提示手动输入上传带宽。
+
+优化逻辑：
+
+- 自动启用 `bbr` 拥塞控制和 `fq` 队列算法。
+- 根据上传带宽和地区模式映射推荐 TCP buffer 档位。
+- 亚太线路使用较保守的 buffer，美欧高延迟线路使用更大 buffer。
+- 按机器内存设置 TCP buffer 上限，避免小内存 VPS 过度放大缓冲区。
+- 同步写入 `net.core.rmem_max` / `net.core.wmem_max` / `tcp_rmem` / `tcp_wmem`。
+- 保留 `tcp_limit_output_bytes = 4194304` 和 `tcp_slow_start_after_idle = 0`。
+
+地区模式参考：
+
+| 模式 | RTT 参考 |
+| --- | --- |
+| 自动判断 | 使用 Speedtest Ping 自动分类 |
+| 亚太线路 | 通常小于 `100ms` |
+| 美欧线路 | 通常 `150-300ms` |
+| 手动 RTT | 按用户输入计算 |
+
+配置同样写入：
+
+```text
+/etc/sysctl.d/99-joeyblog.conf
+```
+
+## 清空网络优化配置
+
+运行脚本后选择：
+
+```text
+11. 清空网络优化配置
+```
+
+脚本会清理本项目写入的网络优化持久配置：
+
+- `net.core.default_qdisc`
+- `net.ipv4.tcp_congestion_control`
+- `net.core.rmem_max` / `net.core.wmem_max`
+- `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem`
+- `net.ipv4.tcp_limit_output_bytes`
+- `net.ipv4.tcp_slow_start_after_idle`
+
+同时删除：
+
+```text
+/etc/modules-load.d/joeyblog-qdisc.conf
+```
+
+该功能只清空网络优化配置，不卸载 BBR 内核，也不移除 Dirty Frag 安全缓解规则。当前运行态参数可能需要重启后完全恢复为系统默认值。
 
 ## 安全缓解
 

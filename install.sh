@@ -83,13 +83,20 @@ clean_sysctl_conf() {
     sudo sed -i '/net.ipv4.tcp_congestion_control/d' "$SYSCTL_CONF"
 }
 
-# 函数：清理亚太线路调优配置
-clean_apac_tuning_conf() {
+# 函数：清理智能带宽优化配置
+clean_smart_tuning_conf() {
     sudo touch "$SYSCTL_CONF"
+    sudo sed -i '/net.core.rmem_max/d' "$SYSCTL_CONF"
+    sudo sed -i '/net.core.wmem_max/d' "$SYSCTL_CONF"
     sudo sed -i '/net.ipv4.tcp_wmem/d' "$SYSCTL_CONF"
     sudo sed -i '/net.ipv4.tcp_rmem/d' "$SYSCTL_CONF"
     sudo sed -i '/net.ipv4.tcp_limit_output_bytes/d' "$SYSCTL_CONF"
     sudo sed -i '/net.ipv4.tcp_slow_start_after_idle/d' "$SYSCTL_CONF"
+}
+
+# 函数：清理亚太线路调优配置
+clean_apac_tuning_conf() {
+    clean_smart_tuning_conf
 }
 
 # 函数：应用亚太机器 TCP 调优
@@ -119,6 +126,339 @@ apply_apac_tuning() {
     echo -e "\033[36m  tcp_rmem:                 \033[1;32m$(sysctl -n net.ipv4.tcp_rmem)\033[0m"
     echo -e "\033[36m  tcp_limit_output_bytes:   \033[1;32m$(sysctl -n net.ipv4.tcp_limit_output_bytes)\033[0m"
     echo -e "\033[36m  tcp_slow_start_after_idle:\033[1;32m $(sysctl -n net.ipv4.tcp_slow_start_after_idle)\033[0m"
+}
+
+# 函数：判断是否为正数
+is_positive_number() {
+    awk -v value="$1" 'BEGIN { exit !(value > 0) }'
+}
+
+# 函数：按内存容量限制智能优化 buffer，单位：MB
+get_tcp_buffer_cap_mb() {
+    local mem_kb
+    mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+
+    if ! [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+        echo 64
+    elif (( mem_kb < 524288 )); then
+        echo 16
+    elif (( mem_kb < 1048576 )); then
+        echo 32
+    else
+        echo 64
+    fi
+}
+
+# 函数：按带宽和地区映射智能优化 buffer，单位：MB
+calculate_smart_buffer_mb() {
+    local bandwidth="$1"
+    local region="$2"
+    local cap_mb="$3"
+    local buffer_mb=16
+
+    bandwidth="${bandwidth%.*}"
+    if ! [[ "$bandwidth" =~ ^[0-9]+$ ]] || (( bandwidth <= 0 )); then
+        bandwidth=1000
+    fi
+
+    if [[ "$region" == "overseas" ]]; then
+        if (( bandwidth < 500 )); then
+            buffer_mb=16
+        elif (( bandwidth < 1000 )); then
+            buffer_mb=48
+        else
+            buffer_mb=64
+        fi
+    else
+        if (( bandwidth < 500 )); then
+            buffer_mb=8
+        elif (( bandwidth < 1000 )); then
+            buffer_mb=12
+        elif (( bandwidth < 2000 )); then
+            buffer_mb=16
+        elif (( bandwidth < 5000 )); then
+            buffer_mb=24
+        elif (( bandwidth < 10000 )); then
+            buffer_mb=28
+        else
+            buffer_mb=32
+        fi
+    fi
+
+    if (( buffer_mb > cap_mb )); then
+        buffer_mb="$cap_mb"
+    fi
+    echo "$buffer_mb"
+}
+
+# 函数：确保 Ookla 官方 speedtest 可用
+ensure_ookla_speedtest() {
+    if command -v speedtest > /dev/null 2>&1; then
+        return 0
+    fi
+
+    local cpu_arch
+    local download_url
+    cpu_arch=$(uname -m)
+    case "$cpu_arch" in
+        x86_64)
+            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+            ;;
+        aarch64)
+            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+            ;;
+        *)
+            echo -e "\033[33m⚠ 当前架构 $cpu_arch 暂无内置 Ookla speedtest 下载地址。\033[0m"
+            return 1
+            ;;
+    esac
+
+    echo -e "\033[33m未检测到 Ookla speedtest，正在安装...\033[0m"
+    (
+        cd /tmp || exit 1
+        rm -rf speedtest speedtest.tgz speedtest.5 speedtest.md
+        wget -q "$download_url" -O speedtest.tgz
+        tar -xzf speedtest.tgz
+        sudo mv speedtest /usr/local/bin/speedtest
+        sudo chmod +x /usr/local/bin/speedtest
+        rm -f speedtest.tgz speedtest.5 speedtest.md
+    )
+}
+
+# 函数：运行 Ookla Speedtest 并解析 Ping/Download/Upload
+run_speedtest_measurement() {
+    SPEEDTEST_PING=""
+    SPEEDTEST_DOWNLOAD=""
+    SPEEDTEST_UPLOAD=""
+
+    ensure_ookla_speedtest || return 1
+
+    echo -e "\033[36m正在运行 Ookla Speedtest 测速，请稍候...\033[0m"
+    local servers_list
+    local speedtest_output=""
+    local attempt=0
+    servers_list=$(speedtest --accept-license --accept-gdpr --servers 2>/dev/null | sed -nE 's/^[[:space:]]*([0-9]+).*/\1/p' | head -n 10)
+    if [[ -z "$servers_list" ]]; then
+        servers_list="auto"
+    fi
+
+    for server_id in $servers_list; do
+        attempt=$((attempt + 1))
+        if (( attempt > 5 )); then
+            break
+        fi
+
+        if [[ "$server_id" == "auto" ]]; then
+            speedtest_output=$(speedtest --accept-license --accept-gdpr 2>&1)
+        else
+            speedtest_output=$(speedtest --accept-license --accept-gdpr --server-id="$server_id" 2>&1)
+        fi
+
+        SPEEDTEST_PING=$(echo "$speedtest_output" | sed -nE 's/.*(Idle Latency|Latency|Ping):[[:space:]]*([0-9]+(\.[0-9]+)?).*/\2/p' | head -n1)
+        SPEEDTEST_DOWNLOAD=$(echo "$speedtest_output" | sed -nE 's/.*[Dd]ownload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -n1)
+        SPEEDTEST_UPLOAD=$(echo "$speedtest_output" | sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -n1)
+
+        if is_positive_number "$SPEEDTEST_UPLOAD" && ! echo "$speedtest_output" | grep -qi "FAILED\|error"; then
+            break
+        fi
+
+        SPEEDTEST_PING=""
+        SPEEDTEST_DOWNLOAD=""
+        SPEEDTEST_UPLOAD=""
+    done
+
+    if is_positive_number "$SPEEDTEST_UPLOAD"; then
+        echo -e "\033[36m  Ping:     \033[1;32m${SPEEDTEST_PING:-未知} ms\033[0m"
+        echo -e "\033[36m  Download: \033[1;32m${SPEEDTEST_DOWNLOAD:-0} Mbit/s\033[0m"
+        echo -e "\033[36m  Upload:   \033[1;32m${SPEEDTEST_UPLOAD} Mbit/s\033[0m"
+        return 0
+    fi
+
+    echo -e "\033[33m⚠ Speedtest 输出解析失败，将改为手动输入带宽和 RTT。\033[0m"
+    return 1
+}
+
+# 函数：读取正数输入
+read_positive_value() {
+    local prompt="$1"
+    local default_value="$2"
+    local value=""
+
+    while true; do
+        echo -n -e "$prompt" >&2
+        read -r value
+        value="${value:-$default_value}"
+        if is_positive_number "$value"; then
+            echo "$value"
+            return 0
+        fi
+        echo -e "\033[31m请输入有效的正数。\033[0m" >&2
+    done
+}
+
+# 函数：选择地区/RTT 模式
+select_tuning_rtt() {
+    local measured_ping="$1"
+    local choice=""
+    local default_rtt=""
+
+    echo -e "\033[36m请选择线路模式：\033[0m"
+    echo -e "\033[33m 1. 自动判断（按 Speedtest RTT）\033[0m"
+    echo -e "\033[33m 2. 亚太线路（RTT < 100ms）\033[0m"
+    echo -e "\033[33m 3. 美欧线路（RTT 150-300ms）\033[0m"
+    echo -e "\033[33m 4. 手动输入 RTT\033[0m"
+    echo -n -e "\033[36m请选择 (1-4，默认 1): \033[0m"
+    read -r choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+        1)
+            if is_positive_number "$measured_ping"; then
+                SMART_RTT_MS="$measured_ping"
+                if awk -v rtt="$SMART_RTT_MS" 'BEGIN { exit !(rtt < 100) }'; then
+                    SMART_REGION="亚太"
+                    SMART_REGION_CODE="asia"
+                elif awk -v rtt="$SMART_RTT_MS" 'BEGIN { exit !(rtt <= 300) }'; then
+                    SMART_REGION="美欧"
+                    SMART_REGION_CODE="overseas"
+                else
+                    SMART_REGION="高延迟"
+                    SMART_REGION_CODE="overseas"
+                fi
+            else
+                SMART_REGION="手动"
+                SMART_REGION_CODE="asia"
+                SMART_RTT_MS=$(read_positive_value "\033[36m请输入实际 RTT(ms，默认 80): \033[0m" "80")
+            fi
+            ;;
+        2)
+            SMART_REGION="亚太"
+            SMART_REGION_CODE="asia"
+            default_rtt="80"
+            if is_positive_number "$measured_ping"; then
+                default_rtt="$measured_ping"
+            fi
+            SMART_RTT_MS=$(read_positive_value "\033[36m请输入实际 RTT(ms，默认 ${default_rtt}): \033[0m" "$default_rtt")
+            ;;
+        3)
+            SMART_REGION="美欧"
+            SMART_REGION_CODE="overseas"
+            default_rtt="220"
+            if is_positive_number "$measured_ping"; then
+                default_rtt="$measured_ping"
+            fi
+            SMART_RTT_MS=$(read_positive_value "\033[36m请输入实际 RTT(ms，默认 ${default_rtt}): \033[0m" "$default_rtt")
+            ;;
+        4)
+            SMART_REGION="手动"
+            SMART_RTT_MS=$(read_positive_value "\033[36m请输入实际 RTT(ms，默认 100): \033[0m" "100")
+            if awk -v rtt="$SMART_RTT_MS" 'BEGIN { exit !(rtt < 120) }'; then
+                SMART_REGION_CODE="asia"
+            else
+                SMART_REGION_CODE="overseas"
+            fi
+            ;;
+        *)
+            echo -e "\033[31m输入无效，使用自动判断。\033[0m"
+            select_tuning_rtt "$measured_ping"
+            ;;
+    esac
+}
+
+# 函数：应用 BBR v3 智能带宽优化
+apply_smart_bandwidth_tuning() {
+    local upload_mbps=""
+    local download_mbps=""
+    local cap_mb=""
+    local buffer_mb=""
+    local buffer_bytes=""
+    local output_bytes="4194304"
+    local smart_algo="bbr"
+    local smart_qdisc="fq"
+
+    echo -e "\033[36m正在准备 BBR v3 智能带宽优化...\033[0m"
+    load_qdisc_module "$smart_qdisc"
+
+    if sudo sysctl -w net.core.default_qdisc="$smart_qdisc" > /dev/null \
+        && sudo sysctl -w net.ipv4.tcp_congestion_control="$smart_algo" > /dev/null; then
+        echo -e "\033[1;32m✔ 已启用 BBR + FQ\033[0m"
+    else
+        echo -e "\033[31m✘ BBR + FQ 启用失败，请确认当前内核支持 BBR 和 fq。\033[0m"
+        return 1
+    fi
+
+    if run_speedtest_measurement; then
+        upload_mbps="${SPEEDTEST_UPLOAD%.*}"
+        download_mbps="${SPEEDTEST_DOWNLOAD%.*}"
+    else
+        upload_mbps=$(read_positive_value "\033[36m请输入上传带宽(Mbit/s，默认 1000): \033[0m" "1000")
+        download_mbps="$upload_mbps"
+    fi
+
+    if ! [[ "$upload_mbps" =~ ^[0-9]+$ ]] || (( upload_mbps <= 0 )); then
+        upload_mbps="1000"
+    fi
+    if ! [[ "$download_mbps" =~ ^[0-9]+$ ]] || (( download_mbps <= 0 )); then
+        download_mbps="$upload_mbps"
+    fi
+
+    select_tuning_rtt "$SPEEDTEST_PING"
+
+    cap_mb=$(get_tcp_buffer_cap_mb)
+    buffer_mb=$(calculate_smart_buffer_mb "$upload_mbps" "$SMART_REGION_CODE" "$cap_mb")
+    buffer_bytes=$((buffer_mb * 1024 * 1024))
+
+    if sudo sysctl -w net.core.rmem_max="$buffer_bytes" > /dev/null \
+        && sudo sysctl -w net.core.wmem_max="$buffer_bytes" > /dev/null \
+        && sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 $buffer_bytes" > /dev/null \
+        && sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 $buffer_bytes" > /dev/null \
+        && sudo sysctl -w net.ipv4.tcp_limit_output_bytes="$output_bytes" > /dev/null \
+        && sudo sysctl -w net.ipv4.tcp_slow_start_after_idle="0" > /dev/null; then
+        echo -e "\033[1;32m✔ BBR v3 智能带宽优化已立即生效\033[0m"
+    else
+        echo -e "\033[31m✘ BBR v3 智能带宽优化应用失败，请检查当前内核是否支持这些 sysctl 项。\033[0m"
+        return 1
+    fi
+
+    clean_sysctl_conf
+    clean_smart_tuning_conf
+    {
+        echo "net.core.default_qdisc=$smart_qdisc"
+        echo "net.ipv4.tcp_congestion_control=$smart_algo"
+        echo "net.core.rmem_max = $buffer_bytes"
+        echo "net.core.wmem_max = $buffer_bytes"
+        echo "net.ipv4.tcp_wmem = 4096 65536 $buffer_bytes"
+        echo "net.ipv4.tcp_rmem = 4096 87380 $buffer_bytes"
+        echo "net.ipv4.tcp_limit_output_bytes = $output_bytes"
+        echo "net.ipv4.tcp_slow_start_after_idle = 0"
+    } | sudo tee -a "$SYSCTL_CONF" > /dev/null
+
+    echo -e "\033[1;32m✔ 智能优化配置已永久写入：$SYSCTL_CONF\033[0m"
+    echo -e "\033[36m  线路模式：               \033[1;32m$SMART_REGION\033[0m"
+    echo -e "\033[36m  计算 RTT：                \033[1;32m${SMART_RTT_MS} ms\033[0m"
+    echo -e "\033[36m  上传/下载：               \033[1;32m${upload_mbps}/${download_mbps} Mbit/s\033[0m"
+    echo -e "\033[36m  推荐缓冲区：             \033[1;32m${buffer_mb}MB\033[0m"
+    echo -e "\033[36m  内存保护上限：           \033[1;32m${cap_mb}MB\033[0m"
+    echo -e "\033[36m  队列算法：               \033[1;32m$(sysctl -n net.core.default_qdisc)\033[0m"
+    echo -e "\033[36m  拥塞控制：               \033[1;32m$(sysctl -n net.ipv4.tcp_congestion_control)\033[0m"
+    echo -e "\033[36m  tcp_wmem:                 \033[1;32m$(sysctl -n net.ipv4.tcp_wmem)\033[0m"
+    echo -e "\033[36m  tcp_rmem:                 \033[1;32m$(sysctl -n net.ipv4.tcp_rmem)\033[0m"
+    echo -e "\033[36m  tcp_limit_output_bytes:   \033[1;32m$(sysctl -n net.ipv4.tcp_limit_output_bytes)\033[0m"
+    echo -e "\033[36m  tcp_slow_start_after_idle:\033[1;32m $(sysctl -n net.ipv4.tcp_slow_start_after_idle)\033[0m"
+}
+
+# 函数：清空本脚本写入的网络优化配置
+clear_network_optimizations() {
+    echo -e "\033[36m正在清空本脚本写入的网络优化配置...\033[0m"
+    clean_sysctl_conf
+    clean_smart_tuning_conf
+    sudo rm -f "$MODULES_CONF"
+    sudo sysctl --system > /dev/null 2>&1 || true
+
+    echo -e "\033[1;32m✔ 已清空网络优化持久配置\033[0m"
+    echo -e "\033[36m  已清理：$SYSCTL_CONF 中的 BBR/qdisc/TCP buffer 参数\033[0m"
+    echo -e "\033[36m  已删除：$MODULES_CONF\033[0m"
+    echo -e "\033[33m  当前运行态参数可能要到重启后完全恢复为系统默认值。\033[0m"
 }
 
 # 函数：加载队列调度模块
@@ -470,8 +810,10 @@ echo -e "\033[33m 6. ⚡ 启用 BBR + FQ_PIE\033[0m"
 echo -e "\033[33m 7. ⚡ 启用 BBR + CAKE\033[0m"
 echo -e "\033[33m 8. 🌏 亚太机器 TCP 调优\033[0m"
 echo -e "\033[33m 9. 🗑️  卸载 BBR 内核\033[0m"
+echo -e "\033[33m10. 🧠 BBR v3 智能带宽优化\033[0m"
+echo -e "\033[33m11. 🧹 清空网络优化配置\033[0m"
 print_separator
-echo -n -e "\033[36m请选择一个操作 (1-9) (｡･ω･｡): \033[0m"
+echo -n -e "\033[36m请选择一个操作 (1-11) (｡･ω･｡): \033[0m"
 read -r ACTION
 
 case "$ACTION" in
@@ -564,7 +906,15 @@ case "$ACTION" in
             echo -e "\033[33m未找到由本脚本安装的 'joeyblog' 内核包。\033[0m"
         fi
         ;;
+    10)
+        echo -e "\033[1;32m(๑•̀ㅂ•́)و✧ 您选择了 BBR v3 智能带宽优化！\033[0m"
+        apply_smart_bandwidth_tuning
+        ;;
+    11)
+        echo -e "\033[1;32m(๑•̀ㅂ•́)و✧ 您选择了清空网络优化配置！\033[0m"
+        clear_network_optimizations
+        ;;
     *)
-        echo -e "\033[31m(￣▽￣)ゞ 无效的选项，请输入 1-9 之间的数字哦~\033[0m"
+        echo -e "\033[31m(￣▽￣)ゞ 无效的选项，请输入 1-11 之间的数字哦~\033[0m"
         ;;
 esac
