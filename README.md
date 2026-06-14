@@ -15,7 +15,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/i
 | 项目 | 要求 |
 | --- | --- |
 | 最低支持系统 | Ubuntu 22.04+ / Debian 12+ |
-| 推荐系统 | Ubuntu 24.04+ / Debian 12 |
+| 推荐系统 | Ubuntu 24.04+ / Debian 12+ |
 | 包管理器 | `apt-get` |
 | 架构 | `x86_64` / `aarch64` |
 | 引导方式 | 建议使用 GRUB |
