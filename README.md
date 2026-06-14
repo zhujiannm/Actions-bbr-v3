@@ -25,7 +25,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/i
 
 本项目当前内核主线为 Linux 7.x。安装内核时脚本会按最低支持系统拦截过旧环境，避免因用户态、initramfs 或引导链路过旧导致启动失败或 kernel panic。推荐系统是更稳妥的部署选择；旧系统仍可使用状态检查、网络调优、清空优化和卸载功能。
 
-安装内核前，脚本会先刷新关键用户态组件：更新 apt 索引，并安装/升级当前系统已安装的 `dpkg`、`kmod`、`initramfs-tools`、`systemd`、`udev`、`grub` 等启动相关组件。该步骤不是全量系统升级，也不会执行 `dist-upgrade`；如果关键用户态刷新失败，脚本会在卸载旧内核前中止安装。
+安装内核前，脚本会先刷新关键用户态组件：更新 apt 索引，并在缺少时补装 `dpkg`、`kmod`、`initramfs-tools`，同时仅升级当前系统已安装的 `dpkg`、`kmod`、`initramfs-tools`、`systemd`、`udev` 等组件。该步骤不是全量系统升级，也不会执行 `dist-upgrade`；脚本不会自动升级 `grub-pc`、`grub-efi-*`、`shim-signed` 等 GRUB 安装器包，避免触发 `grub-install` 设备选择问题。如果关键用户态刷新失败，脚本会在卸载旧内核前中止安装。
 
 ## 菜单功能
 
